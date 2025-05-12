@@ -1,11 +1,16 @@
 import os
 import time
+import json
 import logging
 import argparse
+from collections import Counter
 from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Union
+
 from dotenv import load_dotenv
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -13,39 +18,57 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("scraper.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("sf_recorder_scraper")
+# Import our refactored classes
+from captcha_solver import CaptchaSolver
+from webdriver_wrapper import WebDriverWrapper
+
+# Configure logging
+def setup_logging(log_file="scraper.log"):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger("sf_recorder_scraper")
+
+logger = setup_logging()
 
 class SFRecorderScraper:
-    def __init__(self, headless=True, download_dir=None):
+    """Scraper for SF Recorder Office website"""
+    
+    def __init__(self, headless=True, download_dir=None, temp_dir="tmp"):
         """Initialize the scraper with browser configuration."""
         self.base_url = "https://recorder.sfgov.org"
+        self.download_dir = Path(download_dir) if download_dir else None
+        self.temp_dir = Path(temp_dir)
+        self.temp_dir.mkdir(exist_ok=True)
         
-        # Set up Chrome options
+        self.driver = self._setup_driver(headless)
+        self.browser = WebDriverWrapper(self.driver)
+        self.captcha_solver = CaptchaSolver(temp_dir)
+    
+    def _setup_driver(self, headless):
+        """Set up and configure the WebDriver"""
         chrome_options = Options()
         if headless:
             chrome_options.add_argument("--headless")
+        
+        # Common Chrome options
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--window-size=1920,1080")
         
         # Set download directory if provided
-        if download_dir:
-            prefs = {"download.default_directory": download_dir}
+        if self.download_dir:
+            prefs = {"download.default_directory": str(self.download_dir)}
             chrome_options.add_experimental_option("prefs", prefs)
         
-        self.driver = webdriver.Chrome(options=chrome_options)
-        self.wait = WebDriverWait(self.driver, 10)  # 10 second timeout
-        
+        return webdriver.Chrome(options=chrome_options)
+    
     def navigate_to_site(self):
         """Navigate to the initial site and handle redirects."""
         logger.info(f"Navigating to {self.base_url}")
@@ -59,14 +82,12 @@ class SFRecorderScraper:
         if "disclaimer" in current_url.lower():
             logger.info("Detected disclaimer page")
             self._accept_disclaimer()
-            
-        # Click the Sign On link
+        
         try:
-            sign_on_link = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, "//a[@ng-click='OnSignInClick()']"))
+            # Click the Sign On link
+            self.browser.click_element(
+                By.XPATH, "//a[@ng-click='OnSignInClick()']"
             )
-            logger.info("Clicking the Sign On link")
-            sign_on_link.click()
             time.sleep(2)  # Wait for page transition
         except TimeoutException:
             logger.error("Timed out waiting for the Sign On link")
@@ -78,14 +99,10 @@ class SFRecorderScraper:
     def _accept_disclaimer(self):
         """Accept the disclaimer by clicking the agree button."""
         try:
-            # Wait for the disclaimer page to load and find the agree button
-            agree_button = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, "//input[@type='button' and @value='Agree']"))
+            self.browser.click_element(
+                By.XPATH, "//input[@type='button' and @value='Agree']"
             )
-            logger.info("Clicking the agree button")
-            agree_button.click()
             time.sleep(2)  # Wait for page transition
-            
         except TimeoutException:
             logger.error("Timed out waiting for the disclaimer agree button")
             raise
@@ -96,29 +113,24 @@ class SFRecorderScraper:
     def login(self, email, password):
         """Handle the login process including CAPTCHA."""
         try:
-            # Wait for login form elements
-            email_field = self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email']"))
+            # Fill in login form
+            self.browser.fill_form_field(
+                By.CSS_SELECTOR, "input[type='email']", email
             )
-            password_field = self.driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+            logger.info(f"Entered email: {email}")
             
-            # Fill in credentials
-            logger.info(f"Entering email: {email}")
-            email_field.clear()
-            email_field.send_keys(email)
-            
-            logger.info("Entering password")
-            password_field.clear()
-            password_field.send_keys(password)
-            
-            # Handle CAPTCHA - now with retry logic built in
-            self._solve_captcha(max_retries=2)
-
-            # Find the submit button with more specific selectors
-            submit_button = self.driver.find_element(
-                By.CSS_SELECTOR, 
-                "input[type='submit'][value='Login'][ng-click='LogInUser()']"
+            self.browser.fill_form_field(
+                By.CSS_SELECTOR, "input[type='password']", password
             )
+            logger.info("Entered password")
+            
+            # Handle CAPTCHA
+            # TODO: Need better OCR. Sometimes it works, sometimes it doesn't work until I run 5 times.
+            self._solve_captcha(max_retries=50)
+            
+            # Get submit button
+            submit_button_selector = "input[type='submit'][value='Login'][ng-click='LogInUser()']"
+            submit_button = self.browser.find_element(By.CSS_SELECTOR, submit_button_selector)
             
             # Wait for the button to become enabled (if it's initially disabled)
             if submit_button.get_attribute("disabled"):
@@ -127,25 +139,19 @@ class SFRecorderScraper:
                     # Wait up to 5 seconds for the button to become enabled
                     WebDriverWait(self.driver, 5).until_not(
                         EC.element_attribute_to_include((
-                            By.CSS_SELECTOR, 
-                            "input[type='submit'][value='Login']"
+                            By.CSS_SELECTOR, submit_button_selector
                         ), "disabled")
                     )
                     # Get a fresh reference to the button after waiting
-                    submit_button = self.driver.find_element(
-                        By.CSS_SELECTOR, 
-                        "input[type='submit'][value='Login'][ng-click='LogInUser()']"
-                    )
+                    submit_button = self.browser.find_element(By.CSS_SELECTOR, submit_button_selector)
                 except TimeoutException:
-                    # If still disabled after timeout, try to click it anyway
                     logger.warning("Submit button remained disabled, attempting to click anyway")
             
             # Click the button
             logger.info("Clicking the login button")
             submit_button.click()
-            
             # Wait for successful login
-            self.wait.until(
+            self.browser.wait.until(
                 EC.url_changes(self.driver.current_url)
             )
             
@@ -159,115 +165,45 @@ class SFRecorderScraper:
             raise
     
     def _solve_captcha(self, max_retries=2):
-        """
-        Handle CAPTCHA by taking a screenshot, using OCR, and filling in the result.
-        Will retry up to max_retries times if an incorrect CAPTCHA message appears.
-        """
+        """Handle CAPTCHA solving with retry logic"""
         retries = 0
+        captcha_img_path = self.temp_dir / "captcha.png"
         
         while retries <= max_retries:
             try:
-                # Find the CAPTCHA image
-                captcha_img = self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, "/html/body/div/div[2]/div/div/div/div[2]/div/form/div[4]/div/imagetextcaptcha/div/div/div/canvas"))
+                # Find and screenshot the CAPTCHA
+                captcha_element = self.browser.find_element(
+                    By.XPATH, 
+                    "/html/body/div/div[2]/div/div/div/div[2]/div/form/div[4]/div/imagetextcaptcha/div/div/div/canvas",
+                    wait_for_presence=True
                 )
+                captcha_element.screenshot(str(captcha_img_path))
                 
-                # Take screenshot of the CAPTCHA
-                captcha_img.screenshot("captcha.png")
-                
-                # Open the image and apply preprocessing
-                img = Image.open("captcha.png")
-                
-                # Convert to grayscale
-                img = img.convert('L')
-                
-                # Apply threshold to create binary image
-                threshold = 180  # Slightly lower threshold to capture more detail
-                img = img.point(lambda p: 255 if p > threshold else 0)
-                
-                # Increase size more significantly for better recognition
-                img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-                
-                # Enhance contrast
-                from PIL import ImageEnhance
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(2.0)  # Increase contrast
-                
-                # Save preprocessed image for debugging
-                img.save(f"captcha_processed_{retries}.png")
-                
-                # Try multiple OCR configurations and combine results
-                configs = [
-                    '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 300',
-                    '--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 300',
-                    '--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 300'
-                ]
-                
-                results = []
-                for config in configs:
-                    text = pytesseract.image_to_string(img, config=config)
-                    text = ''.join(c for c in text if c.isalnum())
-                    if text:
-                        results.append(text)
-                
-                # If we have multiple results, choose the most common one or the longest
-                if results:
-                    if len(set(results)) == 1:
-                        captcha_text = results[0]
-                    else:
-                        # Choose the most frequent result, or the longest if tied
-                        from collections import Counter
-                        counter = Counter(results)
-                        most_common = counter.most_common()
-                        if len(most_common) > 1 and most_common[0][1] == most_common[1][1]:
-                            # If tied frequency, choose the longer text
-                            captcha_text = max(results, key=len)
-                        else:
-                            captcha_text = most_common[0][0]
-                else:
-                    # Fallback to basic OCR if all configs failed
-                    captcha_text = pytesseract.image_to_string(
-                        img,
-                        config='--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 300'
-                    )
-                    captcha_text = ''.join(c for c in captcha_text if c.isalnum())
-                
-                # Apply custom post-processing for common mistakes
-                # captcha_text = captcha_text.replace('o', 'O').replace('0', 'O')
-                # captcha_text = captcha_text.replace('G', '6').replace('S', '5')
-                # captcha_text = captcha_text.replace('B', '8').replace('I', '1')
-                # captcha_text = captcha_text.replace('Z', '2')
-                
-                # Make sure we have the expected length (typically 6 characters)
-                expected_length = 6  # Adjust if your CAPTCHAs have a different length
-                if len(captcha_text) > expected_length:
-                    captcha_text = captcha_text[:expected_length]
-                
+                # Solve the CAPTCHA
+                captcha_text = self.captcha_solver.solve(captcha_img_path, retries)
                 logger.info(f"Attempt {retries+1}: Extracted CAPTCHA text: {captcha_text}")
                 
-                # Find and fill in the CAPTCHA input field
-                captcha_input = self.driver.find_element(
-                    By.CSS_SELECTOR, "input[ng-model='UserDetails.ClientCaptcha']"
+                # Enter the CAPTCHA text
+                self.browser.fill_form_field(
+                    By.CSS_SELECTOR, "input[ng-model='UserDetails.ClientCaptcha']", captcha_text
                 )
-                captcha_input.clear()
-                captcha_input.send_keys(captcha_text)
+                
                 # Wait a short time for error message to appear if CAPTCHA is wrong
                 time.sleep(2)
                 
-                # Check if error message is displayed
+                # Check if CAPTCHA was successful
                 try:
-                    submit_button = self.driver.find_element(
+                    submit_button = self.browser.find_element(
                         By.CSS_SELECTOR, 
                         "input[type='submit'][value='Login'][ng-click='LogInUser()']"
                     )
                     if submit_button.get_attribute("disabled"):
                         logger.warning(f"CAPTCHA attempt {retries+1} failed. Retrying...")
                         retries += 1
-                        # Need to refresh the CAPTCHA for next attempt
-                        refresh_button = self.driver.find_element(
+                        # Refresh the CAPTCHA for next attempt
+                        self.browser.click_element(
                             By.CSS_SELECTOR, "img[ng-click='drawCanvas()']"
                         )
-                        refresh_button.click()
                         time.sleep(1)  # Wait for new CAPTCHA to load
                     else:
                         logger.info("CAPTCHA successful!")
@@ -287,71 +223,23 @@ class SFRecorderScraper:
             except Exception as e:
                 logger.error(f"Error solving CAPTCHA: {str(e)}")
                 raise
-            
-            # Clean up the images (uncomment for production)
-            # for i in range(retries):
-            #     if os.path.exists(f"captcha_processed_{i}.png"):
-            #         os.remove(f"captcha_processed_{i}.png")
-            # if os.path.exists("captcha.png"):
-            #     os.remove("captcha.png")
+        
+        # Clean up the images
+        # self.captcha_solver.cleanup(retries)
     
     def scrape_data(self, save_path=None):
         """
         Scrape data from the website after login.
         This needs to be customized based on what data you want to extract.
         """
-        try:
-            # Wait for the main content to load
-            main_content = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'main-content')]"))
-            )
-            
-            # Example: Extract table data
-            # Modify these selectors based on the actual structure of the site
-            tables = self.driver.find_elements(By.TAG_NAME, "table")
-            
-            all_data = []
-            
-            for i, table in enumerate(tables):
-                logger.info(f"Processing table {i+1}/{len(tables)}")
-                
-                # Extract headers
-                headers = [th.text for th in table.find_elements(By.TAG_NAME, "th")]
-                
-                # Extract rows
-                rows = []
-                for tr in table.find_elements(By.TAG_NAME, "tr")[1:]:  # Skip header row
-                    row_data = [td.text for td in tr.find_elements(By.TAG_NAME, "td")]
-                    rows.append(row_data)
-                
-                table_data = {
-                    "headers": headers,
-                    "rows": rows
-                }
-                
-                all_data.append(table_data)
-            
-            # Save data if path provided
-            if save_path:
-                self._save_data(all_data, save_path)
-            
-            return all_data
-            
-        except TimeoutException:
-            logger.error("Timed out waiting for main content")
-            raise
-        except Exception as e:
-            logger.error(f"Error scraping data: {str(e)}")
-            raise
+        # Not implemented yet.
+        return {}
     
-    def _save_data(self, data, save_path):
+    def save_data(self, data, save_path):
         """Save the scraped data to a file."""
-        import json
+        save_path = Path(save_path)
+        save_path.parent.mkdir(exist_ok=True)
         
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        
-        # Save as JSON
         with open(save_path, 'w') as f:
             json.dump(data, f, indent=4)
         
@@ -359,20 +247,27 @@ class SFRecorderScraper:
     
     def close(self):
         """Close the browser and clean up."""
-        if self.driver:
+        if hasattr(self, 'driver') and self.driver:
             self.driver.quit()
             logger.info("Browser closed")
 
 
-def main():
-    """Main function to run the scraper."""
+def parse_arguments():
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='SF Recorder Office Scraper')
     parser.add_argument('--email', help='Login email')
     parser.add_argument('--password', help='Login password')
     parser.add_argument('--headless', action='store_true', help='Run in headless mode')
-    parser.add_argument('--output', help='Output file path', default=f'data/sf_recorder_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+    parser.add_argument('--output', help='Output file path', 
+                       default=f'data/sf_recorder_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+    parser.add_argument('--temp-dir', help='Directory for temporary files', default='tmp')
     
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    """Main function to run the scraper."""
+    args = parse_arguments()
     
     # Load environment variables from .env file
     load_dotenv()
@@ -385,17 +280,27 @@ def main():
         logger.error("Email and password are required. Provide them via command line arguments or .env file")
         return
     
+    # Create directories
+    download_dir = Path("downloads")
+    download_dir.mkdir(exist_ok=True)
+    
+    temp_dir = Path(args.temp_dir)
+    temp_dir.mkdir(exist_ok=True)
+    
     scraper = None
     try:
-        # Create download directory
-        download_dir = os.path.join(os.getcwd(), "downloads")
-        os.makedirs(download_dir, exist_ok=True)
-        
         # Initialize and run scraper
-        scraper = SFRecorderScraper(headless=args.headless, download_dir=download_dir)
+        scraper = SFRecorderScraper(
+            headless=args.headless, 
+            download_dir=str(download_dir),
+            temp_dir=str(temp_dir)
+        )
         scraper.navigate_to_site()
         scraper.login(email, password)
-        # data = scraper.scrape_data(save_path=args.output)
+        data = scraper.scrape_data()
+        
+        if data and args.output:
+            scraper.save_data(data, args.output)
         
         logger.info("Scraping completed successfully")
         
