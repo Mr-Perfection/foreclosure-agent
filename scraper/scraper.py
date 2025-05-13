@@ -1,8 +1,10 @@
+import time
 import os
 import logging
 import argparse
 from datetime import datetime
 from pathlib import Path
+from selenium.webdriver.common.by import By
 
 from dotenv import load_dotenv
 
@@ -79,14 +81,26 @@ def main():
 
         # Navigate to advanced search page
         advanced_search_button_selector = "input[type='button'][value='Advanced Search']"
-        scraper.navigate(advanced_search_button_selector)
+        scraper.click_element(advanced_search_button_selector)
 
         # Fill in advanced search form
         from_date = "05/07/2025"
         to_date = "05/12/2025"
         scraper.fill_advanced_search_form(from_date, to_date)
         scraper.navigate_to_search()
-        # data = scraper.scrape_data()
+        
+        # Wait for and click the dropdown with proper wait conditions
+        scraper.click_element("//a[@id='ddlDocsPerPage']",By.XPATH)
+        logger.info("Clicked on dropdown")
+        
+        # Wait for and click the 100 per page option
+        scraper.click_element("//a[@id='ddlDocsPerPage']/ul/li[5]",By.XPATH)
+        logger.info("Selected 100 results per page")
+        
+        # Wait for the selection to take effect
+        scraper.browser.wait.until(
+            lambda driver: driver.find_element(By.XPATH, "//a[@id='ddlDocsPerPage']").text.strip() == "100"
+        )
         
         # if data and args.output:
         #     scraper.save_data(data, args.output)
