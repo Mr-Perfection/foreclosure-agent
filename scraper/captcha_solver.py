@@ -103,19 +103,6 @@ class CaptchaSolver:
         for text in results:
             # Fix common misrecognitions for this site
             processed = text
-            # This actually makes it worse
-            # Commonly confused character pairs in this captcha
-            # if 'O' in processed:
-            #     processed = processed.replace('O', '0')
-            # if 'S' in processed and '5' not in processed:
-            #     processed = processed.replace('S', '5')
-            # if 'I' in processed and '1' not in processed:
-            #     processed = processed.replace('I', '1')
-            # if 'B' in processed and '8' not in processed:
-            #     processed = processed.replace('B', '8')
-            # if 'G' in processed and '6' not in processed:
-            #     processed = processed.replace('G', '6')
-            
             # Ensure we have the expected length
             if len(processed) > expected_length:
                 processed = processed[:expected_length]
