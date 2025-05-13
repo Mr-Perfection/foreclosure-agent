@@ -2,20 +2,35 @@ import logging
 import pytesseract
 from PIL import Image, ImageEnhance, ImageFilter
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from collections import Counter
 
 logger = logging.getLogger("sf_recorder_scraper")
 
 class CaptchaSolver:
-    """Separate class for handling CAPTCHA solving logic"""
+    """Class for handling CAPTCHA solving using OCR techniques with Tesseract"""
     
-    def __init__(self, temp_dir="tmp"):
+    def __init__(self, temp_dir: str = "tmp"):
+        """
+        Initialize the CAPTCHA solver
+        
+        Args:
+            temp_dir: Directory to store temporary image files
+        """
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(exist_ok=True)
     
     def preprocess_image(self, img_path: Path, retry_count: int) -> Image.Image:
-        """Preprocess the CAPTCHA image for better OCR results"""
+        """
+        Preprocess the CAPTCHA image to improve OCR accuracy
+        
+        Args:
+            img_path: Path to the CAPTCHA image file
+            retry_count: Current retry attempt number (used for naming debug files)
+            
+        Returns:
+            Preprocessed PIL Image object
+        """
         img = Image.open(img_path)
         
         # Convert to grayscale
@@ -42,36 +57,49 @@ class CaptchaSolver:
         return img
     
     def get_ocr_results(self, img: Image.Image) -> List[str]:
-        """Get OCR results using multiple configurations"""
+        """
+        Get OCR results using multiple Tesseract configurations
+        
+        Args:
+            img: Preprocessed PIL Image object
+            
+        Returns:
+            List of recognized text strings from different OCR configurations
+        """
         configs = [
-            # Add more configurations with different PSM modes
+            # PSM 7: Treat image as a single text line
             '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 400',
+            # PSM 8: Treat image as a single word
             '--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 400',
-            '--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 400',
-            # This actually makes it worse
-            # # Add specialized config for better number recognition
-            # '--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 400',
-            # This actually makes it worse
-            # # Add config focusing on confusable characters
-            # '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -c classify_bln_numeric_mode=1 --dpi 400'
+            # PSM 6. Assume a Single Uniform Block of Text
+            '--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --dpi 400',
         ]
         
         results = []
         for config in configs:
             text = pytesseract.image_to_string(img, config=config)
-            text = ''.join(c for c in text if c.isalnum())
+            text = ''.join(c for c in text if c.isalnum())  # Keep only alphanumeric characters
             if text:
                 results.append(text)
         
         return results
     
     def select_best_result(self, results: List[str], expected_length: int = 6) -> str:
-        """Select the best result from multiple OCR attempts"""
+        """
+        Select the best OCR result from multiple attempts
+        
+        Args:
+            results: List of OCR text results
+            expected_length: Expected length of the CAPTCHA text
+            
+        Returns:
+            The most likely correct CAPTCHA text
+        """
         if not results:
             return ""
             
         # Apply post-processing to fix common misrecognitions
-        processed_results = []
+        processed_results: List[str] = []
         for text in results:
             # Fix common misrecognitions for this site
             processed = text
@@ -102,13 +130,14 @@ class CaptchaSolver:
             processed_results = results
             
         if len(set(processed_results)) == 1:
+            # If all results are identical, that's likely correct
             captcha_text = processed_results[0]
         else:
             # Choose the most frequent result
             counter = Counter(processed_results)
             most_common = counter.most_common()
             
-            # For your specific case (PYYHSO vs PYYH63)
+            # For specific case (PYYHSO vs PYYH63)
             # Check for partial matches that might have correct start but wrong end
             for result in processed_results:
                 if result.startswith('PYYH') and result[-2:].isdigit():
@@ -125,10 +154,19 @@ class CaptchaSolver:
         return captcha_text
     
     def solve(self, captcha_img_path: Path, retry_count: int) -> str:
-        """Solve the CAPTCHA"""
+        """
+        Solve the CAPTCHA by preprocessing and applying OCR
+        
+        Args:
+            captcha_img_path: Path to the CAPTCHA image file
+            retry_count: Current retry attempt number
+            
+        Returns:
+            The recognized CAPTCHA text
+        """
         img = self.preprocess_image(captcha_img_path, retry_count)
         results = self.get_ocr_results(img)
-        
+        print(f"CAPTCHA OCR Results: {results}")
         if not results:
             # Fallback to basic OCR if all configs failed
             text = pytesseract.image_to_string(
@@ -140,8 +178,13 @@ class CaptchaSolver:
         
         return self.select_best_result(results)
     
-    def cleanup(self, retry_count: int = 0):
-        """Clean up temporary files"""
+    def cleanup(self, retry_count: int = 0) -> None:
+        """
+        Clean up temporary image files
+        
+        Args:
+            retry_count: Number of retry attempts (to delete all processed images)
+        """
         captcha_path = self.temp_dir / "captcha.png"
         if captcha_path.exists():
             captcha_path.unlink()
