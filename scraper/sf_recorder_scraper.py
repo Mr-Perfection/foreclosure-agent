@@ -253,15 +253,44 @@ class SFRecorderScraper:
         # Clean up the images
         self.captcha_solver.cleanup(retries)
 
-    def navigate(self, selector: str) -> None:
+    def click_element(self, selector: str, by: By = By.CSS_SELECTOR) -> None:
         """
         Navigate to a page by clicking on a button or link
         
         Args:
             selector: CSS selector for the element to click
         """
-        element = self.browser.find_element(By.CSS_SELECTOR, selector)
-        element.click()
+        self.browser.click_element(by, selector)
+
+    def _clear_date_field(self, field_name: str) -> None:
+        """
+        Clear a date input field by sending a fixed number of backspaces
+        
+        Args:
+            field_name: The name attribute of the input field to clear
+        """
+        input_field_css_selector = f"input[name='{field_name}']"
+        field = self.browser.find_element(
+            By.CSS_SELECTOR, input_field_css_selector, wait_for_presence=True
+        )
+        
+        # Send fixed number of backspaces
+        backspace_count = 50
+        for _ in range(backspace_count):
+            field.send_keys("\b")      # Backspace
+        
+        self.browser.wait.until(
+            lambda driver: driver.find_element(By.CSS_SELECTOR, input_field_css_selector).text.strip() == ""
+        )
+
+        # Verify field is empty
+        current_value = self.driver.execute_script(
+            f"return document.querySelector(\"{input_field_css_selector}\").value;"
+        )
+        if current_value:
+            logger.warning(f"Field {field_name} still not empty after clearing. Current value: '{current_value}'")
+        
+        return field
 
     def fill_advanced_search_form(self, from_date: str, to_date: str) -> None:
         """
@@ -271,37 +300,23 @@ class SFRecorderScraper:
             from_date: Starting date in MM/DD/YYYY format
             to_date: Ending date in MM/DD/YYYY format
         """
-        # Very aggressive clearing for the from date field
-        from_selector = "input[name='fromDocDate']"
-        
-        # Clear using multiple methods
-        from_field = self.browser.find_element(By.CSS_SELECTOR, from_selector, wait_for_presence=True)
-        
-        # 1. Clear using standard method - this does not work with date picker for some reason.
-        # from_field.clear()
-
-        # 2. backspace 20 times. This works clearing date picker.
-        for _ in range(20):
-            from_field.send_keys("\b")      # Backspace
-        
-        # 4. Check if field is empty and log warning if not - fixed JavaScript
-        current_value = self.driver.execute_script("return document.querySelector(\"input[name='fromDocDate']\").value;")
-        if current_value:
-            logger.warning(f"Field still not empty after clearing. Current value: '{current_value}'")
-        
+        # Clear and fill from date field
+        from_field = self._clear_date_field("fromDocDate")
         from_field.send_keys(from_date)
-        
         logger.info(f"Entered from date: {from_date}")
         
-        # Keep the existing approach for the to date field
-        to_field = self.browser.find_element(
-            By.CSS_SELECTOR, "input[name='toDocDate']", wait_for_presence=True
-        )
-        # to_field.clear()
-        for _ in range(20):
-            to_field.send_keys("\b")      # Backspace
+        # Clear and fill to date field
+        to_field = self._clear_date_field("toDocDate")
         to_field.send_keys(to_date)
         logger.info(f"Entered to date: {to_date}")
+        
+        # Close any open datetime pickers
+        self.driver.execute_script("""
+            var pickers = document.querySelectorAll('.datetimepicker');
+            pickers.forEach(function(picker) {
+                picker.style.display = 'none';
+            });
+        """)
     
     def navigate_to_search(self) -> None:
         """

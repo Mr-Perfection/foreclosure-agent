@@ -49,7 +49,7 @@ class WebDriverWrapper:
             return self.driver.find_element(by, value)
     
     def click_element(self, by: str, value: str, 
-                     wait_for_clickable: bool = True) -> WebElement:
+                     wait_for_clickable: bool = True, wait_for_presence: bool = True) -> WebElement:
         """
         Find and click an element
         
@@ -57,6 +57,7 @@ class WebDriverWrapper:
             by: Selenium locator type
             value: Locator value to find the element
             wait_for_clickable: Whether to wait until the element is clickable
+            wait_for_presence: Whether to wait until the element is present in DOM
             
         Returns:
             The clicked WebElement
@@ -64,7 +65,7 @@ class WebDriverWrapper:
         Raises:
             TimeoutException: If element not found or not clickable within timeout
         """
-        element = self.find_element(by, value, wait_for_clickable=wait_for_clickable)
+        element = self.find_element(by, value, wait_for_clickable=wait_for_clickable, wait_for_presence=wait_for_presence)
         element.click()
         return element
     
