@@ -2,6 +2,7 @@ import time
 import os
 import logging
 import argparse
+import csv
 from datetime import datetime
 from pathlib import Path
 from selenium.webdriver.common.by import By
@@ -41,6 +42,8 @@ def parse_arguments():
     parser.add_argument('--headless', action='store_true', help='Run in headless mode')
     parser.add_argument('--output', help='Output file path', 
                        default=f'data/sf_recorder_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+    parser.add_argument('--csv-output', help='CSV output file path',
+                       default=f'data/sf_recorder_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
     parser.add_argument('--temp-dir', help='Directory for temporary files', default='tmp')
     
     return parser.parse_args()
@@ -68,6 +71,9 @@ def main():
     temp_dir = Path(args.temp_dir)
     temp_dir.mkdir(exist_ok=True)
     
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+    
     scraper = None
     try:
         # Initialize and run scraper
@@ -88,22 +94,16 @@ def main():
         to_date = "05/12/2025"
         scraper.fill_advanced_search_form(from_date, to_date)
         scraper.navigate_to_search()
-        
-        # Wait for and click the dropdown with proper wait conditions
-        scraper.click_element("//a[@id='ddlDocsPerPage']",By.XPATH)
-        logger.info("Clicked on dropdown")
-        
-        # Wait for and click the 100 per page option
-        scraper.click_element("//a[@id='ddlDocsPerPage']/ul/li[5]",By.XPATH)
-        logger.info("Selected 100 results per page")
-        
-        # Wait for the selection to take effect
-        scraper.browser.wait.until(
-            lambda driver: driver.find_element(By.XPATH, "//a[@id='ddlDocsPerPage']").text.strip() == "100"
-        )
-        
-        # if data and args.output:
-        #     scraper.save_data(data, args.output)
+        # Extract table data
+        logger.info("Extracting table data")
+        table_data = scrape_search_results_table(scraper)
+        # Save to CSV
+        if table_data:
+            save_to_csv(table_data, args.csv_output)
+            import pdb; pdb.set_trace()
+            logger.info(f"Saved {len(table_data)} records to CSV: {args.csv_output}")
+        else:
+            logger.warning("No data was extracted from the table")
         
         logger.info("Scraping completed successfully")
         
@@ -113,6 +113,76 @@ def main():
         if scraper:
             # scraper.close()
             pass
+
+
+def scrape_search_results_table(scraper: SFRecorderScraper):
+    """
+    Scrape the search results table data
+    
+    Args:
+        scraper: The SFRecorderScraper instance
+        
+    Returns:
+        List of dictionaries containing the scraped data
+    """
+    # Wait for the table to be visible
+    table_selector = "#SearchResultsGrid"
+    scraper.browser.wait.until(
+        lambda driver: driver.find_element(By.CSS_SELECTOR, table_selector).is_displayed()
+    )
+    
+    # Get all table rows
+    rows = scraper.driver.find_elements(By.CSS_SELECTOR, "#SearchResultsGrid tbody tr")
+    logger.info(f"Found {len(rows)} rows in the search results table")
+    
+    results = []
+    for row in rows:
+        # Extract data from each cell using the driver to find elements
+        # Get each cell's text by column position
+        cells = row.find_elements(By.TAG_NAME, "td")
+        
+        # Ensure we have enough cells
+        if len(cells) >= 5:  # At least 5 cells per row in the table
+            # First cell is form check.
+            # Try direct text extraction
+            doc_number = cells[1].text.strip()
+            doc_date = cells[2].text.strip()
+            filing_code = cells[3].text.strip()
+            names = cells[4].text.strip()
+            
+            results.append({
+                "document_number": doc_number,
+                "document_date": doc_date,
+                "filing_code": filing_code,
+                "names": names
+            })
+        else:
+            raise Exception(f"Row has fewer than expected cells: {len(cells)}")
+    return results
+
+
+def save_to_csv(data, csv_path):
+    """
+    Save the scraped data to CSV
+    
+    Args:
+        data: List of dictionaries containing the scraped data
+        csv_path: Path to save the CSV file
+    """
+    if not data:
+        return
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    
+    # Write to CSV
+    with open(csv_path, 'w', newline='') as csvfile:
+        fieldnames = ["document_number", "document_date", "filing_code", "names"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        writer.writeheader()
+        for row in data:
+            writer.writerow(row)
 
 
 if __name__ == "__main__":
