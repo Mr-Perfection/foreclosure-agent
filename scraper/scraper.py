@@ -3,6 +3,7 @@ import os
 import logging
 import argparse
 import csv
+import json
 from datetime import datetime
 from pathlib import Path
 from selenium.webdriver.common.by import By
@@ -15,18 +16,24 @@ from dotenv import load_dotenv
 from sf_recorder_scraper import SFRecorderScraper
 
 # Configure logging
-def setup_logging(log_file: str = "scraper.log") -> logging.Logger:
+def setup_logging(log_file: str = "scraper.log", log_level: str = "INFO") -> logging.Logger:
     """
     Configure and set up logging for the application
     
     Args:
         log_file: Path to the log file
+        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         
     Returns:
         Logger instance configured for the application
     """
+    # Convert string log level to logging constant
+    numeric_level = getattr(logging, log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f'Invalid log level: {log_level}')
+    
     logging.basicConfig(
-        level=logging.INFO,
+        level=numeric_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_file),
@@ -35,6 +42,7 @@ def setup_logging(log_file: str = "scraper.log") -> logging.Logger:
     )
     return logging.getLogger("sf_recorder_scraper")
 
+# Create global logger instance with default settings
 logger = setup_logging()
 
 def parse_arguments():
@@ -48,6 +56,8 @@ def parse_arguments():
     parser.add_argument('--csv-output', help='CSV output file path',
                        default=f'data/sf_recorder_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
     parser.add_argument('--temp-dir', help='Directory for temporary files', default='tmp')
+    parser.add_argument('--log-level', help='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)',
+                       default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
     
     return parser.parse_args()
 
@@ -79,6 +89,10 @@ def main():
     
     scraper = None
     try:
+        # Update logger level based on command line argument
+        logger.setLevel(getattr(logging, args.log_level.upper()))
+        logger.info(f"Starting scraper with log level: {args.log_level}")
+        
         # Initialize and run scraper
         scraper = SFRecorderScraper(
             headless=args.headless, 
@@ -94,10 +108,10 @@ def main():
 
         # Fill in advanced search form
         from_date = "05/07/2025"
-        to_date = "05/17/2025"
+        to_date = "05/16/2025"
         scraper.fill_advanced_search_form(from_date, to_date)
         scraper.navigate_to_search()
-
+        
         scraper.click_element("//a[@id='ddlDocsPerPage']",By.XPATH)
         logger.info("Clicked on dropdown for results per page.")
         
@@ -141,14 +155,11 @@ def scrape_all_pages(scraper: SFRecorderScraper) -> list:
     
     while True:
         logger.info(f"Scraping page {page_num}...")
-        
-        # Wait for the table to be ready on the current page
         try:
             WebDriverWait(scraper.driver, 20).until(
                 EC.presence_of_element_located((By.ID, "SearchResultsGrid"))
             )
-            # Add a small delay to ensure content is fully rendered, if necessary
-            time.sleep(2) # Adjust as needed, or use more specific wait conditions
+            time.sleep(2) # Allow table content to render fully
         except TimeoutException:
             logger.error(f"Timeout waiting for search results table on page {page_num}.")
             break
@@ -163,20 +174,23 @@ def scrape_all_pages(scraper: SFRecorderScraper) -> list:
         # Try to find the active "Next page" button
         try:
             next_page_button_xpath = "//a[@title='Next page' and not(contains(@class, 'inactive')) and @ng-click]"
-            next_page_button = WebDriverWait(scraper.driver, 5).until(
+            next_page_button_clickable = WebDriverWait(scraper.driver, 5).until(
                 EC.element_to_be_clickable((By.XPATH, next_page_button_xpath))
             )
-            # Store a reference to an element on the current page to check for staleness later
-            # This helps ensure the page has actually navigated
-            old_table_id = scraper.driver.find_element(By.ID, "SearchResultsGrid").id
             
-            next_page_button.click()
+            # Find an element in the current table to check for staleness after click
+            # Using the first row's internalid as a simple reference point if available, or just the table itself.
+            try:
+                first_row_in_table = scraper.driver.find_element(By.CSS_SELECTOR, "#SearchResultsGrid tbody tr")
+                old_element_ref = first_row_in_table
+            except NoSuchElementException:
+                 logger.warning("Could not find first row for staleness check, using table itself.")
+                 old_element_ref = scraper.driver.find_element(By.ID, "SearchResultsGrid")
+
+            next_page_button_clickable.click()
             logger.info(f"Clicked 'Next page' to go to page {page_num + 1}.")
 
-            # Wait for the page to navigate and the table to refresh
-            WebDriverWait(scraper.driver, 20).until(
-                EC.staleness_of(scraper.driver.find_element(By.ID, old_table_id))
-            )
+            WebDriverWait(scraper.driver, 20).until(EC.staleness_of(old_element_ref))
             WebDriverWait(scraper.driver, 20).until(
                 EC.presence_of_element_located((By.ID, "SearchResultsGrid"))
             )
@@ -184,7 +198,7 @@ def scrape_all_pages(scraper: SFRecorderScraper) -> list:
 
         except (TimeoutException, NoSuchElementException):
             logger.info("No active 'Next page' button found or timed out. Assuming end of results.")
-            break # Exit loop if no active next button or it's not clickable
+            break
             
         page_num += 1
         if page_num > 50: # Safety break to prevent infinite loops during development
@@ -195,125 +209,126 @@ def scrape_all_pages(scraper: SFRecorderScraper) -> list:
 
 
 def scrape_search_results_table(scraper: SFRecorderScraper) -> list:
-    """
-    Scrape the search results table data from the CURRENTLY DISPLAYED page.
+    """Scrapes data from current page table, clicks each row for side panel details."""
+    page_records = []
     
-    Args:
-        scraper: The SFRecorderScraper instance
-        
-    Returns:
-        List of dictionaries containing the scraped data from the current page.
-    """
-    results = []
     try:
         # This function assumes the table #SearchResultsGrid is already loaded and visible
         rows = scraper.driver.find_elements(By.CSS_SELECTOR, "#SearchResultsGrid tbody tr")
         logger.info(f"Found {len(rows)} rows in the current page's search results table")
-        
-        if not rows:
-            logger.info("No rows found in table on this page.")
-            return results
+        if not rows: return []
 
-        for i, row in enumerate(rows):
+        for i, row_element in enumerate(rows):
+            record = {}
             try:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                # The HTML structure provided previously has 5 visible data cells,
-                # plus potentially hidden ones. The ng-show column is usually first if visible.
-                # Based on Untitled-1, the visible data columns are:
-                # 1. Document Number
-                # 2. Document Date
-                # 3. SearchFilingCode
-                # 4. Names
-                # 5. Purchase (icon)
-                # If the first ng-show column for report selection is hidden, data starts at cells[0]
-                # If it's visible, data starts at cells[1].
-                # Let's check number of cells to be safer.
+                cells = row_element.find_elements(By.TAG_NAME, "td")
+                if len(cells) < 5:
+                    logger.warning(f"Row {i+1} has only {len(cells)} cells. Expected at least 5. Skipping row.")
+                    continue
 
-                # Assuming the checkbox column (ng-show="IsReportViewEnable && DisplayReportView") is hidden as per example
-                # Then: doc_number=cells[0], doc_date=cells[1], filing_code=cells[2], names=cells[3]
+                # 1. Scrape basic data from the main table row
+                record['document_number'] = cells[1].text.strip()
+                record['document_date'] = cells[2].text.strip()
+                record['filing_code_name'] = cells[3].text.strip()
+                record['names_table'] = cells[4].text.strip()      # Names summary from main table
                 
-                # Corrected indexing based on the provided HTML where data cells are 0, 1, 2, 3
-                # after the initial hidden checkbox cell if it exists.
-                # If that hidden cell is counted by find_elements, then indices are 1,2,3,4.
-                # The example HTML shows 6 th elements, but the first two `ng-show` are hidden.
-                # `idcolumn` (doc num), `datecolumn`, `min_names` (filing code), `min_names name_wid_th` (names)
-                # This implies 4 main data columns visible in the example.
+                logger.info(f"Processing row {i+1}/{len(rows)}: Doc# {record['document_number']}")
+
+                # 2. Click the row (e.g., the document number cell) to open side panel
+                # Ensure the cell is clickable and visible
+                doc_num_cell_to_click = cells[1]
+                # WebDriverWait(scraper.driver, 10).until(EC.element_to_be_clickable(doc_num_cell_to_click))
+                doc_num_cell_to_click.click()
+                # Explicitly click the "All Info" tab and wait for it to be active
+                all_info_tab_xpath = "//li[@aria-controls='hor_1_tab_item-5'][normalize-space()='All Info']"
+                all_info_tab_element = WebDriverWait(scraper.driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, all_info_tab_xpath))
+                )
+                all_info_tab_element.click()
+                logger.debug(f"Clicked 'All Info' tab for Doc# {record['document_number']}.")
+                # 3. Wait for side panel to load and show details for the correct document
+                panel_doc_num_xpath = "//div[@class='names_height']//div[@class='form-group'][.//label[normalize-space()='Document Number']]//div[@class='col-sm-6']/div[@contenteditable='false']"
+                WebDriverWait(scraper.driver, 20).until(
+                    lambda driver: driver.execute_script(
+                        "return arguments[0].textContent", 
+                        driver.find_element(By.XPATH, panel_doc_num_xpath)
+                    ).strip() == record['document_number']
+                )
+                logger.debug(f"Side panel content confirmed for Doc# {record['document_number']}")
                 
-                # The user's previous successful scrape used cells[1] for doc_number.
-                # This suggests there's always a cell at index 0 (maybe the hidden checkbox placeholder)
+                # 4. Extract detailed information from panel
+                panel_content_area_xpath = "//div[@class='names_height']"
+                panel_element = scraper.driver.find_element(By.XPATH, panel_content_area_xpath)
+
+                try:
+                    pages_xpath = ".//div[@class='form-group'][.//label[normalize-space()='Pages']]//div[@class='col-sm-6']/div[@contenteditable='false']"
+                    record['pages'] = panel_element.find_element(By.XPATH, pages_xpath).get_attribute('textContent').strip()
+                    logger.debug(f"Found pages: {record['pages']}")
+                except NoSuchElementException:
+                    record['pages'] = None
+                    logger.debug(f"Panel - Pages not found for Doc# {record['document_number']}")
+                try:
+                    # More absolute XPath for filing code, starting from a known stable ancestor or document root
+                    # This also assumes panel_element (//div[@class='names_height']) is a reliable ancestor.
+                    filing_code_xpath = "//div[@class='names_height']//div[@class='form-group clearfix ng-scope' and .//label[normalize-space()='Filing Code']]//div[@contenteditable='false' and @class='ng-binding']"
+                    record['filing_code'] = scraper.driver.find_element(By.XPATH, filing_code_xpath).get_attribute('textContent').strip() # Search from scraper.driver
+                    logger.debug(f"Found filing code: {record['filing_code']}")
+                except NoSuchElementException:
+                    record['filing_code'] = None
+                    logger.debug(f"Panel - Filing Code not found for Doc# {record['document_number']}")
                 
-                expected_min_cells = 5 # Based on user's previous code: checkbox, doc_number, doc_date, filing_code, names
-                                       # OR doc_number, doc_date, filing_code, names, purchase_icon
+                record['titles_descriptions'] = []
+                try:
+                    titles_table_xpath = ".//table[.//th/span[normalize-space(.)='Title(s)']]"
+                    titles_table = panel_element.find_element(By.XPATH, titles_table_xpath)
+                    titles_rows = titles_table.find_elements(By.XPATH, "./tbody/tr")
+                    for tr_title in titles_rows:
+                        title_element = tr_title.find_element(By.XPATH, "./td[1]")
+                        description_element = tr_title.find_element(By.XPATH, "./td[2]")
+                        record['titles_descriptions'].append({
+                            "title": title_element.get_attribute('textContent').strip(),
+                            "description": description_element.get_attribute('textContent').strip()
+                        })
+                    logger.debug(f"Found {len(record['titles_descriptions'])} titles/descriptions")
+                except NoSuchElementException:
+                    logger.debug(f"Panel - Titles/Descriptions table not found for Doc# {record['document_number']}")
+
+                record['party_details'] = [] # Granters and Grantees
+                try:
+                    names_grid_table_xpath = ".//names-grid//table[.//th[normalize-space(.)='Name Type']]"
+                    names_table = panel_element.find_element(By.XPATH, names_grid_table_xpath)
+                    names_rows = names_table.find_elements(By.XPATH, "./tbody/tr")
+                    for tr_name in names_rows:
+                        name_type_elements = tr_name.find_elements(By.XPATH, "./td[1]/span") # Check for span first
+                        name_type_element = name_type_elements[0] if name_type_elements else tr_name.find_element(By.XPATH, "./td[1]")
+                        name_element = tr_name.find_element(By.XPATH, "./td[2]")
+                        record['party_details'].append({
+                            "type": name_type_element.get_attribute('textContent').strip(),
+                            "name": name_element.get_attribute('textContent').strip()
+                        })
+                    logger.debug(f"Found {len(record['party_details'])} party details")
+                except NoSuchElementException:
+                    logger.debug(f"Panel - Names grid (granters/grantees) not found for Doc# {record['document_number']}")
                 
-                if len(cells) >= 4: # Check for at least 4 data cells
-                    # From Untitled-1, the first visible td is doc number.
-                    # If the first column `ng-show` is truly hidden and not picked by `find_elements`,
-                    # then cell indices would be 0, 1, 2, 3 for the four data points.
-                    # User code was cells[1], cells[2], cells[3], cells[4] -> this implies there's a cell[0]
-                    # Let's try to be more robust by looking for specific content or classes if simple indexing fails
+                page_records.append(record)
+
+            except TimeoutException as te:
+                logger.error(f"Timeout interacting with side panel for Doc# {record.get('document_number', 'N/A')} on row {i+1}: {te}")
+                if record.get('document_number'): # If we have basic info, save it
+                    page_records.append(record) # Add partially filled record
+            except Exception as e_row_panel:
+                logger.error(f"Error processing row {i+1} (Doc# {record.get('document_number', 'N/A')}) or its side panel: {str(e_row_panel)}", exc_info=False)
+                if record.get('document_number'): # If we have basic info, save its
+                    page_records.append(record) # Add partially filled record
                     
-                    # Sticking to user's last working indexing: cells[1] to cells[4] for data
-                    # This assumes cells[0] is the checkbox column whether hidden or not.
-                    if len(cells) < 5: # Need at least 5 cells for indices 1-4
-                        logger.warning(f"Row {i+1} has only {len(cells)} cells. Expected at least 5. Skipping row.")
-                        # You might want to print cell texts here for debugging:
-                        # for k, cell_debug in enumerate(cells):
-                        #     logger.debug(f"Cell {k} text: '{cell_debug.text.strip()[:50]}'")
-                        continue
-
-                    doc_number_text = cells[1].text.strip()
-                    doc_date_text = cells[2].text.strip()
-                    filing_code_text = cells[3].text.strip() # This corresponds to "SearchFilingCode"
-                    names_text = cells[4].text.strip()      # This corresponds to "Names"
-
-                    # Sometimes, the text might be inside a div or another element within the td
-                    # If direct .text is empty, try finding a div.
-                    if not doc_number_text and cells[1].find_elements(By.TAG_NAME, "div"):
-                        doc_number_text = cells[1].find_element(By.TAG_NAME, "div").text.strip()
-                    if not doc_date_text and cells[2].find_elements(By.TAG_NAME, "div"):
-                        doc_date_text = cells[2].find_element(By.TAG_NAME, "div").text.strip()
-                    if not filing_code_text and cells[3].find_elements(By.TAG_NAME, "div"):
-                        filing_code_text = cells[3].find_element(By.TAG_NAME, "div").text.strip()
-                    if not names_text and cells[4].find_elements(By.TAG_NAME, "div"):
-                        names_text = cells[4].find_element(By.TAG_NAME, "div").text.strip()
-                    
-                    results.append({
-                        "document_number": doc_number_text,
-                        "document_date": doc_date_text,
-                        "filing_code": filing_code_text,
-                        "names": names_text
-                    })
-                else:
-                    logger.warning(f"Row {i+1} has fewer than 4 data cells ({len(cells)} found). Skipping row.")
-                    # Log cell content for debugging
-                    # for k_debug, cell_debug in enumerate(cells):
-                    #    logger.debug(f"Row {i+1}, Cell {k_debug} HTML: {cell_debug.get_attribute('outerHTML')[:100]}")
-
-
-            except Exception as e_row:
-                logger.error(f"Error processing row {i+1} on current page: {str(e_row)}", exc_info=False) # Set exc_info=True for more details
-                # Log cell content for debugging
-                # try:
-                #    for k_debug, cell_debug in enumerate(cells):
-                #        logger.debug(f"Failed Row {i+1}, Cell {k_debug} HTML: {cell_debug.get_attribute('outerHTML')[:100]}")
-                # except NameError: # cells might not be defined if error was before
-                #    pass
-                continue # Skip to next row
-                
     except Exception as e_table:
         logger.error(f"Error finding or processing table rows on current page: {str(e_table)}", exc_info=True)
 
-    return results
+    return page_records
 
 
 def save_to_csv(data: list, csv_path: str):
-    """
-    Save the scraped data to CSV
-    
-    Args:
-        data: List of dictionaries containing the scraped data
-        csv_path: Path to save the CSV file
-    """
+    """Save the scraped data to CSV, serializing complex fields to JSON."""
     if not data:
         logger.warning("No data provided to save_to_csv.")
         return
@@ -321,13 +336,23 @@ def save_to_csv(data: list, csv_path: str):
     # Ensure directory exists
     Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
     
+    # Define fieldnames including new ones for panel data
+    fieldnames = [
+        "document_number", "document_date", "filing_code_name", "names_table",
+        "pages", "filing_code", "titles_descriptions", "party_details"
+    ]
+    
     with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ["document_number", "document_date", "filing_code", "names"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore') # extrasaction='ignore' is safer
         writer.writeheader()
-        for row in data:
-            writer.writerow(row)
+        for record_row in data:
+            # Serialize list/dict fields to JSON strings
+            if 'titles_descriptions' in record_row and isinstance(record_row['titles_descriptions'], list):
+                record_row['titles_descriptions'] = json.dumps(record_row['titles_descriptions'])
+            if 'party_details' in record_row and isinstance(record_row['party_details'], list):
+                record_row['party_details'] = json.dumps(record_row['party_details'])
+            writer.writerow(record_row)
+            
     logger.info(f"Data successfully saved to {csv_path}")
 
 
