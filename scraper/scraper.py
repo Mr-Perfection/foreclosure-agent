@@ -110,8 +110,8 @@ def main():
         from_date = "05/07/2025"
         to_date = "05/16/2025"
         scraper.fill_advanced_search_form(from_date, to_date)
+        time.sleep(1)
         scraper.navigate_to_search()
-        
         scraper.click_element("//a[@id='ddlDocsPerPage']",By.XPATH)
         logger.info("Clicked on dropdown for results per page.")
         

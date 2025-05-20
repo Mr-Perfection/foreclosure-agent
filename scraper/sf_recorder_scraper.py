@@ -142,8 +142,9 @@ class SFRecorderScraper:
             )
             logger.info("Entered password")
             
-            # Handle CAPTCHA
-            self._solve_captcha(max_retries=50)
+            # # Handle CAPTCHA
+            import pdb; pdb.set_trace()
+            # self._solve_captcha(max_retries=50)
             
             # Get submit button
             submit_button_selector = "input[type='submit'][value='Login'][ng-click='LogInUser()']"
@@ -275,14 +276,9 @@ class SFRecorderScraper:
         )
         
         # Send fixed number of backspaces
-        backspace_count = 50
+        backspace_count = 10
         for _ in range(backspace_count):
             field.send_keys("\b")      # Backspace
-        
-        self.browser.wait.until(
-            lambda driver: driver.find_element(By.CSS_SELECTOR, input_field_css_selector).text.strip() == ""
-        )
-
         # Verify field is empty
         current_value = self.driver.execute_script(
             f"return document.querySelector(\"{input_field_css_selector}\").value;"
@@ -300,11 +296,21 @@ class SFRecorderScraper:
             from_date: Starting date in MM/DD/YYYY format
             to_date: Ending date in MM/DD/YYYY format
         """
+        time.sleep(1)
+        # Close any open datetime pickers
+        self.driver.execute_script("""
+            // Hide all datetime pickers to prevent them from interfering with input
+            document.querySelectorAll('.datetimepicker').forEach(picker => picker.style.display = 'none');
+        """)
         # Clear and fill from date field
         from_field = self._clear_date_field("fromDocDate")
         from_field.send_keys(from_date)
         logger.info(f"Entered from date: {from_date}")
-        
+        # Close any open datetime pickers
+        self.driver.execute_script("""
+            // Hide all datetime pickers to prevent them from interfering with input
+            document.querySelectorAll('.datetimepicker').forEach(picker => picker.style.display = 'none');
+        """)
         # Clear and fill to date field
         to_field = self._clear_date_field("toDocDate")
         to_field.send_keys(to_date)
@@ -312,10 +318,8 @@ class SFRecorderScraper:
         
         # Close any open datetime pickers
         self.driver.execute_script("""
-            var pickers = document.querySelectorAll('.datetimepicker');
-            pickers.forEach(function(picker) {
-                picker.style.display = 'none';
-            });
+            // Hide all datetime pickers to prevent them from interfering with input
+            document.querySelectorAll('.datetimepicker').forEach(picker => picker.style.display = 'none');
         """)
     
     def navigate_to_search(self) -> None:
