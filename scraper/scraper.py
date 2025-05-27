@@ -10,6 +10,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
 
 from dotenv import load_dotenv
 
@@ -45,6 +48,77 @@ def setup_logging(log_file: str = "scraper.log", log_level: str = "INFO") -> log
 # Create global logger instance with default settings
 logger = setup_logging()
 
+def setup_postgres_connection(db_name="sf_recorder", user="postgres", password="", host="localhost", port="5432"):
+    """
+    Set up PostgreSQL database connection and create necessary tables if they don't exist.
+    
+    Args:
+        db_name: Database name
+        user: PostgreSQL username
+        password: PostgreSQL password
+        host: Database host
+        port: Database port
+        
+    Returns:
+        psycopg connection object
+    """
+    # First connect to default postgres database to create our db if it doesn't exist
+    try:
+        conn = psycopg.connect(
+            dbname="postgres",
+            user=user,
+            password=password,
+            host=host,
+            port=port
+        )
+        conn.autocommit = True
+        cursor = conn.cursor()
+        
+        # Check if database exists, if not create it
+        cursor.execute(f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{db_name}'")
+        exists = cursor.fetchone()
+        if not exists:
+            cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name)))
+            logger.info(f"Created database {db_name}")
+        
+        cursor.close()
+        conn.close()
+        
+        # Connect to our database
+        conn = psycopg.connect(
+            dbname=db_name,
+            user=user,
+            password=password,
+            host=host,
+            port=port
+        )
+        conn.autocommit = True
+        cursor = conn.cursor()
+        
+        # Create table if it doesn't exist
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS recorder_records (
+            id SERIAL PRIMARY KEY,
+            document_number VARCHAR(50),
+            document_date VARCHAR(50),
+            filing_code_name TEXT,
+            names_table TEXT,
+            pages VARCHAR(20),
+            filing_code TEXT,
+            titles_descriptions JSONB,
+            party_details JSONB,
+            page_number INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        
+        logger.info("PostgreSQL database and table setup complete")
+        return conn
+        
+    except Exception as e:
+        logger.error(f"Database connection error: {str(e)}", exc_info=True)
+        return None
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='SF Recorder Office Scraper')
@@ -58,6 +132,11 @@ def parse_arguments():
     parser.add_argument('--temp-dir', help='Directory for temporary files', default='tmp')
     parser.add_argument('--log-level', help='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)',
                        default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+    parser.add_argument('--db-name', help='PostgreSQL database name', default='sf_recorder')
+    parser.add_argument('--db-user', help='PostgreSQL username', default='postgres')
+    parser.add_argument('--db-password', help='PostgreSQL password', default='postgres')
+    parser.add_argument('--db-host', help='PostgreSQL host', default='localhost')
+    parser.add_argument('--db-port', help='PostgreSQL port', default='5432')
     
     return parser.parse_args()
 
@@ -86,6 +165,15 @@ def main():
     
     data_dir = Path("data")
     data_dir.mkdir(exist_ok=True)
+    
+    # Setup PostgreSQL connection
+    db_conn = setup_postgres_connection(
+        db_name=args.db_name,
+        user=args.db_user,
+        password=args.db_password,
+        host=args.db_host,
+        port=args.db_port
+    )
     
     scraper = None
     try:
@@ -123,11 +211,20 @@ def main():
         )
         logger.info("Confirmed 100 results per page is set.")
         
-        all_table_data = scrape_all_pages(scraper)
+        print("Hello, world!")
+        return
+        # Scrape all pages, saving each page to CSV and database
+        all_table_data = scrape_all_pages(
+            scraper,
+            db_conn=db_conn,
+            csv_path=args.csv_output
+        )
         
+        # Optionally save all data to a combined CSV
         if all_table_data:
-            save_to_csv(all_table_data, args.csv_output)
-            logger.info(f"Saved {len(all_table_data)} records from all pages to CSV: {args.csv_output}")
+            combined_csv_path = Path(args.csv_output).parent / f"sf_recorder_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            save_to_csv(all_table_data, str(combined_csv_path))
+            logger.info(f"Saved {len(all_table_data)} records from all pages to combined CSV: {combined_csv_path}")
         else:
             logger.warning("No data was extracted from any page.")
         
@@ -138,14 +235,20 @@ def main():
     finally:
         if scraper:
             scraper.close()
+        if db_conn:
+            db_conn.close()
+            logger.info("Database connection closed.")
 
 
-def scrape_all_pages(scraper: SFRecorderScraper) -> list:
+def scrape_all_pages(scraper: SFRecorderScraper, db_conn=None, csv_path=None, save_all_csv=True) -> list:
     """
-    Scrapes table data from all pages.
+    Scrapes table data from all pages and saves each page's data to database and CSV.
     
     Args:
         scraper: The SFRecorderScraper instance.
+        db_conn: PostgreSQL database connection object.
+        csv_path: Base path for CSV files.
+        save_all_csv: Whether to also save a combined CSV with all data.
         
     Returns:
         A list of all records scraped from all pages.
@@ -166,6 +269,15 @@ def scrape_all_pages(scraper: SFRecorderScraper) -> list:
 
         current_page_records = scrape_search_results_table(scraper)
         if current_page_records:
+            # Save to PostgreSQL if connection is available
+            if db_conn:
+                save_to_postgres(db_conn, current_page_records, page_num)
+            # import pdb; pdb.set_trace()
+            # Save individual page to CSV if path is provided
+            if csv_path:
+                save_to_csv(current_page_records, csv_path, page_num)
+                
+            # Add to all records for potential combined CSV later
             all_records.extend(current_page_records)
             logger.info(f"Scraped {len(current_page_records)} records from page {page_num}.")
         else:
@@ -255,7 +367,7 @@ def scrape_search_results_table(scraper: SFRecorderScraper) -> list:
                     ).strip() == record['document_number']
                 )
                 logger.debug(f"Side panel content confirmed for Doc# {record['document_number']}")
-                
+                time.sleep(1)
                 # 4. Extract detailed information from panel
                 panel_content_area_xpath = "//div[@class='names_height']"
                 panel_element = scraper.driver.find_element(By.XPATH, panel_content_area_xpath)
@@ -327,11 +439,85 @@ def scrape_search_results_table(scraper: SFRecorderScraper) -> list:
     return page_records
 
 
-def save_to_csv(data: list, csv_path: str):
-    """Save the scraped data to CSV, serializing complex fields to JSON."""
+def save_to_postgres(conn, data: list, page_number: int):
+    """
+    Save the scraped data to PostgreSQL database.
+    
+    Args:
+        conn: PostgreSQL connection object
+        data: List of record dictionaries to save
+        page_number: The page number these records came from
+    """
+    if not conn:
+        logger.error("Database connection is not available. Data will not be saved to PostgreSQL.")
+        return
+    
+    if not data:
+        logger.warning("No data provided to save_to_postgres.")
+        return
+    
+    try:
+        cursor: psycopg.Cursor = conn.cursor()
+        
+        # Prepare data for batch insert
+        records_to_insert = []
+        for record in data:
+            # import pdb; pdb.set_trace()
+            # Convert list/dict fields to JSON strings for PostgreSQL
+            titles_descriptions = json.dumps(record.get('titles_descriptions', [])) if isinstance(record.get('titles_descriptions'), list) else None
+            party_details = json.dumps(record.get('party_details', [])) if isinstance(record.get('party_details'), list) else None
+            
+            records_to_insert.append((
+                record.get('document_number'),
+                record.get('document_date'),
+                record.get('filing_code_name'),
+                record.get('names_table'),
+                record.get('pages'),
+                record.get('filing_code'),
+                titles_descriptions,
+                party_details,
+                page_number
+            ))
+        
+        # Perform batch insert
+        cursor.executemany(
+            """
+            INSERT INTO recorder_records 
+            (document_number, document_date, filing_code_name, names_table, 
+             pages, filing_code, titles_descriptions, party_details, page_number)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            records_to_insert
+        )
+        
+        conn.commit()
+        logger.info(f"Successfully inserted {len(records_to_insert)} records from page {page_number} into database")
+        
+    except Exception as e:
+        logger.error(f"Error saving to PostgreSQL: {str(e)}", exc_info=True)
+        if conn:
+            conn.rollback()
+
+
+def save_to_csv(data: list, csv_path: str, page_number: int = None, append: bool = False):
+    """
+    Save the scraped data to CSV, serializing complex fields to JSON.
+    
+    Args:
+        data: List of record dictionaries to save
+        csv_path: Path to save CSV file
+        page_number: The page number these records came from, added to filename if provided
+        append: Whether to append to an existing CSV file (True) or create a new one (False)
+    """
     if not data:
         logger.warning("No data provided to save_to_csv.")
         return
+    
+    # Modify path to include page number if provided
+    if page_number is not None:
+        path_obj = Path(csv_path)
+        filename = path_obj.stem + f"_page{page_number}" + path_obj.suffix
+        csv_path = path_obj.parent / filename
     
     # Ensure directory exists
     Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
@@ -339,18 +525,29 @@ def save_to_csv(data: list, csv_path: str):
     # Define fieldnames including new ones for panel data
     fieldnames = [
         "document_number", "document_date", "filing_code_name", "names_table",
-        "pages", "filing_code", "titles_descriptions", "party_details"
+        "pages", "filing_code", "titles_descriptions", "party_details", 
+        "page_number"  # Add page_number field
     ]
     
-    with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore') # extrasaction='ignore' is safer
-        writer.writeheader()
+    mode = 'a' if append else 'w'
+    write_header = not (append and Path(csv_path).exists())
+    
+    with open(csv_path, mode, newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+        if write_header:
+            writer.writeheader()
+            
         for record_row in data:
+            # Add page number to each record
+            if page_number is not None:
+                record_row['page_number'] = page_number
+                
             # Serialize list/dict fields to JSON strings
             if 'titles_descriptions' in record_row and isinstance(record_row['titles_descriptions'], list):
                 record_row['titles_descriptions'] = json.dumps(record_row['titles_descriptions'])
             if 'party_details' in record_row and isinstance(record_row['party_details'], list):
                 record_row['party_details'] = json.dumps(record_row['party_details'])
+                
             writer.writerow(record_row)
             
     logger.info(f"Data successfully saved to {csv_path}")
